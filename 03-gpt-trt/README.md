@@ -1,0 +1,581 @@
+# 项目③：Transformer 推理部署与优化
+
+> 用一个小 GPT（40 M 参数）把 **Transformer 推理的三个阶段**都量一遍：
+> **prefill、decode、KV cache 管理**，并回答一个具体问题——
+> **"为什么工业界要把 prefill 和 decode 拆成两个引擎？"**
+>
+> 答案不是从博客上抄的，是在本机量出来的：**一个引擎无法同时优化两个阶段**（§5.1）。
+
+---
+
+## 0. TL;DR
+
+| 结论 | 数字 | 在哪 |
+|---|---|---|
+| **一个引擎优化不了两个阶段** | `opt=(1,1)` 时 decode 1.076 ms / prefill 10.332 ms；`opt=(1,512)` 时反过来 **1.725 / 6.563** | §5.1 |
+| **decode 的瓶颈是 kernel launch，不是带宽** | 加 CUDA Graph 后有效带宽 66 → **144 GB/s** | §5.2 |
+| **FP16 的收益取决于瓶颈类型** | decode（访存）**1.43–1.64×**；prefill（计算）**2.0–2.5×** | §5.3 |
+| **Graph 重放与直连逐位相同** | 8 个形状 **`max\|diff\| = 0.000e+00`** | §5.4 |
+| **KV cache 进引擎后 argmax 零分歧** | TRT vs PyTorch 相对误差 5e-4–9.5e-4，**19/19 步选词一致** | §6.2 |
+| **O(P) 的 cache 拷贝不是瓶颈（这个模型）** | P 从 1→511，exec 只涨 **13%**（理论 16%） | §6.3 |
+| **batch 几乎免费** | batch 1→4，exec **+0.6%**，每 token 1301 → **326 µs（3.99×）** | §6.4 |
+| **host 侧 74 次调用消不掉** | **0.20 ms**，占 decode 的 **15–19%**，且 CUDA Graph 用不了 | §6.5 |
+| **注意力采样不用写 plugin** | Deformable Attention：engine vs PyTorch **5.586e-03**，**1.8163 → 0.1092 ms（16.64×）** | §10 |
+
+**五条被证伪的判断**（含我自己三次"对比对象不一致"）见 §7。
+
+---
+
+## 1. 这个项目做了什么、不是什么
+
+### 做了什么
+
+| 阶段 | 内容 | 产出 |
+|---|---|---|
+| **W1** | ONNX 导出（dynamic batch/seq）→ TRT，多 shape 精度与延迟 | 5 个 shape 的延迟表 |
+| **W2** | 四种优化 × 四个形状的四路交错对比 | `opt_shape` / CUDA Graph / FP16 / FP32 的组合矩阵 |
+| **W3** | **KV cache 作为引擎 in/out**，逐步自回归解码 | 每 token 延迟、延迟 vs P、batch 摊薄 |
+
+### 不是什么（重要）
+
+| 不是 | 原因 |
+|---|---|
+| **不是 LLM 服务框架** | 没有 continuous batching、没有调度器、没有 PagedAttention 实现 |
+| **不是训练** | 权重是随机初始化的（`WEIGHT_SEED=1234`），只关心**推理**的延迟与数值 |
+| **不是 7B 模型** | 40 M 参数，因为目标是**看清单个瓶颈**，不是压 SOTA 吞吐 |
+| **没有多卡 / 没有 Orin** | 单卡 RTX 5060 Laptop（sm_120） |
+
+**一句话定位：这是一个"用可复现的小模型，把 Transformer 推理的每个瓶颈都量化一遍"的实验台。**
+
+---
+
+## 2. 模型、权重、测量口径
+
+### 模型配置（`gpt.py` 的 `DEFAULT_CFG`）
+
+```
+vocab=4096  block_size=512  n_layer=12  n_head=8  n_embd=512  head_dim=64
+参数量        : 40,120,832
+ONNX（fp32）  : 166 MB
+engine（fp32）: 155 MB      engine（fp16）: 79.8 MB
+```
+
+### 为什么选这个规模（W1 的教训，见 §4）
+
+最初用 `n_layer=2, n_embd=64`（10 万参数），实测 **`seq=1` 和 `seq=32` 延迟完全一样**（0.398 / 0.353 ms）——
+因为 10 万参数的模型算 32 个 token 只要几微秒，**0.35 ms 全是"一次调用的固定开销"**。
+**测到的是开销，不是计算。** 放大 400 倍后（40 M），seq 的影响才显现。
+
+### 权重种子必须固定
+
+`w3_export_decode.py` 和 `w3_cache.py` 都用 `torch.manual_seed(1234)` 构造模型，并打印**权重校验和**（`612938.619019`）。
+**不固定的话，engine 里是权重 A、"标准答案"是权重 B —— 输出会"量级对、数值全错"。** 这是本项目最隐蔽的一个坑（§8.3）。
+
+### 测量口径（每个数字都要标注）
+
+| 口径 | 含义 | 用在哪 |
+|---|---|---|
+| **per-call** | 每次调用后 `synchronize()`，取中位数 | W1/W2 的绝对延迟表 |
+| **block** | 循环 N 次只在两端 sync 一次 | 吞吐、交错对比 |
+| **配对** | 同一进程内轮流测 A/B，比值**逐轮配对** | W2 四路矩阵（消温度漂移） |
+| **两趟法** | 第一趟全做、第二趟只做 host，`exec = 差` | W3 的 host/exec 拆分 |
+
+**跨运行的数字一律标注**——这台笔记本上同一个 engine 文件两次运行能差 **16%**（P3 项目里最大见过 2.4×）。
+
+---
+
+## 3. 文件索引
+
+| 文件 | 作用 |
+|---|---|
+| `gpt.py` | decoder-only GPT（含 KV cache、自检、`DEFAULT_CFG`） |
+| `export_gpt_onnx.py` | 导出**无 cache** 的 prefill 图（dynamic batch/seq） |
+| `build_engine.py` | ONNX → engine，profile 可调（`--opt/--min/--max`），输出 `tokens/s` |
+| `w2_graph.py` | 单引擎 CUDA Graph vs 直连 |
+| `w2_fp16.py` | ONNX → FP16 → engine，两个途径的数值验证 |
+| `w2_matrix.py` | **四路交错**：{FP32,FP16} × {直连,Graph} |
+| `w3_export_decode.py` | 导出**带 cache** 的 decode 图（25 in / 25 out） |
+| `w3_cache.py` | 逐步自回归解码 + 精度对拍 |
+| `w3_latency_vs_p.py` | 固定 P 重复测，看 O(P) |
+| `w3_batch.py` | batch × P 矩阵 |
+| `c1_deform_attn.py` | Deformable Attention 向量化实现 + 暴力参考对拍 |
+| `c2_export_deform.py` | 导出 ONNX（两个变体）+ 打印 GridSample 属性 + trtexec |
+| `c2_verify_engine.py` | **验证 engine 输出**（不只是 ONNX）+ 延迟对比 |
+| `w1_out/` `c_out/` | ONNX / engine 产物 |
+
+> BEV 侧的算子边界（BEV pooling / 点云 scatter / `IPluginV3`）在 **`04-bev-ops/`**。
+
+---
+
+## 4. W1：dynamic seq_len 部署（以及"小模型测不出东西"）
+
+### 4.1 导出
+
+`export_gpt_onnx.py` 用 legacy 导出器（`dynamo=False`）——**PyTorch 2.9+ 默认的 dynamo 导出器依赖 `onnxscript`，而 legacy 对 `dynamic_axes` 的 dim_param 名字更可控。**
+
+```
+节点数     : 1083
+算子       : Add Cast Concat Constant Div Equal Erf Gather Identity LayerNormalization
+             MatMul Mul Reshape Shape Slice Softmax Split Transpose Unsqueeze Where
+没有 Range  : ✅（Range 会让动态 shape 在 TRT 里难以推导）
+多 shape 精度: batch/seq 5 种组合，max|diff| ≤ 2.7e-06
+```
+
+### 4.2 三档 profile 的绝对延迟（`opt_shape` 决定 TRT 挑哪套 kernel）
+
+| opt | seq=1 | seq=64 | seq=256 | **seq=512** | 4×512 |
+|---|---|---|---|---|---|
+| **(1, 1)** | **2.071** | **2.428** | 6.265 | 13.499 | 51.735 |
+| **(1, 256)** | 3.443 | 2.950 | **5.055** | 10.225 | **37.644** |
+| **(1, 512)** | 3.623 | 3.211 | 5.536 | **9.286** | 37.926 |
+| 最差/最好 | **1.75×** | 1.32× | 1.24× | **1.45×** | 1.37× |
+
+**换成吞吐**：
+
+| 场景 | opt=(1,1) | opt=(1,512) | 提升 |
+|---|---|---|---|
+| decode（seq=1） | **483 tokens/s** | 276 tokens/s | **+75%** |
+| prefill（seq=512） | 37,929 tokens/s | **55,135 tokens/s** | **+45%** |
+
+### 4.3 一个反直觉的观察
+
+`opt=(1,256)` 或 `(1,512)` 的引擎上，**seq=1 比 seq=64 还慢**（3.443 vs 2.950）。
+**因为 TRT 按 seq=256/512 挑了 kernel，`M=1` 时严重欠载。**
+
+**这不是 bug，是"一个引擎只能顾一头"的第一个证据。**
+
+---
+
+## 5. W2：四种优化，四个形状
+
+### 5.1 结论①：一个引擎优化不了 prefill 和 decode
+
+**四路矩阵里最干净的对比是"两个引擎都走 Graph 重放"**——因为 Graph 路径完全不经过 `set_input_shape`，两个引擎走同一条代码路径，差异只来自引擎内部的 tactic 选择。
+
+| 引擎 | seq=1 | seq=64 | seq=256 | **seq=512** |
+|---|---|---|---|---|
+| `opt=(1,1)` | **1.076** | **1.450** | 4.658 | 10.332 |
+| `opt=(1,512)` | 1.725 | 1.776 | **3.768** | **6.563** |
+| 差距 | **(1,1) 快 1.60×** | 1.23× | (1,512) 快 1.24× | **(1,512) 快 1.57×** |
+
+> **同一个模型、同一块 GPU、同一份 ONNX——只改 profile 里的三个数字，
+> decode 和 prefill 的最优选择就是相反的。**
+>
+> **这就是 vLLM 的 chunked prefill、TRT-LLM 的 in-flight batching、
+> Mooncake 的 PD 分离之所以存在的根本原因。**
+
+### 5.2 结论②：decode 的瓶颈是 launch 开销，不是带宽
+
+**同一个 FP32 引擎、同一形状（seq=1）**：
+
+| | 耗时 | 有效带宽（154.9 MB ÷ t） |
+|---|---|---|
+| 直连 | 2.299 ms | **66 GB/s** |
+| **CUDA Graph** | **1.076 ms** | **144 GB/s** |
+
+**同样的权重、同样的计算，带宽翻倍 —— 说明不加 Graph 时根本还没到带宽上限。**
+
+**Graph 的绝对收益随 seq 递减，这正好是"launch 开销与计算量无关"的指纹**：
+
+| seq | Graph 加速比 | **省下的绝对时间** |
+|---|---|---|
+| 1 | **1.47×** | **1.041 ms** |
+| 64 | 1.25× | 0.575 ms |
+| 256 | 1.13× | 0.579 ms |
+| 512 | **1.06×** | 0.541 ms |
+
+**（seq≥64 时省下的时间几乎常数 0.54–0.58 ms —— 这就是这台机器上一个引擎的"每次调用固定成本"。）**
+
+### 5.3 结论③：FP16 的收益取决于瓶颈类型
+
+| seq | fp32/直连 | fp32/Graph | fp16/直连 | **fp16/Graph** | Graph 单独 | FP16 单独 | **叠加** |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.96 | 0.98 | 1.23 | **0.55** | **2.00×** | 1.60× | **3.60×** |
+| 64 | 2.151 | 1.435 | 1.293 | **0.753** | 1.49× | 1.72× | 2.86× |
+| 256 | 5.016 | 4.558 | 2.477 | **2.185** | **1.10×** | 2.02× | 2.30× |
+| 512 | 10.957 | 10.514 | 4.688 | **4.394** | **1.04×** | 2.35× | 2.51× |
+
+**两条曲线一个降一个升**：
+
+```
+Graph 的收益：2.00× → 1.49× → 1.10× → 1.04×     单调递减（消 launch）
+FP16  的收益：1.60× → 1.72× → 2.02× → 2.35×     单调递增（减计算/字节）
+```
+
+**而且 decode 阶段两者**超线性**叠加**：`2.00 × 1.60 = 3.20`，实测 **3.60×**。
+**因为 FP16 转换引入了 1156 个额外的 Cast kernel，而它们的 launch 开销被 Graph 一并消掉了**（节点数 1083 → 2239）。
+
+**FP16 在 decode 上没拿到理论值**：
+
+| | 权重 | 耗时 | 有效带宽 |
+|---|---|---|---|
+| FP32 + Graph | 154.9 MB | 1.076 ms | **144 GB/s** |
+| FP16 + Graph | 79.8 MB | 0.658 ms | **121 GB/s** |
+
+**搬的字节少一半，但达到的带宽也低了 16%** → 净收益 1.64× 而不是 1.94×。
+**原因：`M=1` 的 GEMV 太小（每层 6.3 MB 拆成多个 kernel），打不满 HBM。**
+
+### 5.4 校验：8/8 逐位相同
+
+**四路矩阵里每个 Graph 路径都和同引擎的直连比过一次输出**：
+
+```
+fp32/graph  max|diff| = 0.000e+00  ✓      （seq=1/64/256/512 全部）
+fp16/graph  max|diff| = 0.000e+00  ✓
+```
+
+**校验方法：先 `out.zero_()` 再 `replay()`** —— 和 P3 项目里"先填 NaN 再跑"同一个思路，**用来排除"图是空的所以看起来快"**。
+
+**这一步曾经救过一次**（§8.4）：某次 `rel = 0.82` 被我误判成空图，其实是两个 Runner 用了**不同的随机输入**。
+
+---
+
+## 6. W3：KV cache 进引擎
+
+### 6.1 为什么必须拆成两个图
+
+```python
+# gpt.py L120-123
+# 只有"整段 prefill"时才需要 mask；逐 token 生成（T=1）时未来位置不存在。
+if past_len == 0:
+    att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+```
+
+**`past_len` 来自张量尺寸，导出时会被冻结成追踪那一刻的分支。** 导出时的 TracerWarning 直接证实了这一点：
+
+```
+TracerWarning: if past_len == 0:
+  Converting a tensor to a Python boolean might cause the trace to be incorrect.
+```
+
+| 图 | 节点数 | mask 算子 |
+|---|---|---|
+| **prefill**（`gpt.onnx`） | 1083 | ✅ `Equal` / `Where` / `Cast` |
+| **decode**（`gpt_decode.onnx`） | **919** | ❌ 正好少了这 164 个 |
+
+**所以 prefill 和 decode 从图结构上就是两个不同的程序，不是同一个程序的两组参数。**
+
+**decode 图的 IO**：
+
+```
+输入：input_ids[1,1] + past_k_i[1,H,P,hd] + past_v_i[1,H,P,hd]     (i = 0..11)
+输出：logits[1,1,V] + new_k_i[1,H,P+1,hd] + new_v_i[1,H,P+1,hd]
+共 25 输入 / 25 输出。P 是动态维度。
+```
+
+**dim_param 的命名规则（这里最容易搞反）**：
+
+| 维度 | 输入/输出关系 | 名字 |
+|---|---|---|
+| `batch` | **同一个值** | **必须同名** `"batch"` |
+| `past_len` | 输入 P、输出 P+1（**不同值**） | **必须不同名**：`"past_len"` / `"total_len"` |
+
+**同名 = 断言两者相等。搞反了要么报错，要么静默算错。**
+
+### 6.2 逐步解码验证：argmax 19/19
+
+**单次前向看不出 cache 接错**（第一次的 cache 是外部给的，输入相同必然相同）。
+**真正的验证必须让被测对象**自己喂自己**：
+
+```
+step  max|diff|     相对误差     cache 长度
+   0  2.384e-06   1.529e-06          17
+   1  1.937e-06   1.165e-06          18
+   ...
+   4  2.146e-06   1.310e-06          21
+（ONNXRuntime，纯 FP32）
+```
+
+**TRT 引擎逐步解码（20 步）**：
+
+```
+相对误差 : 5.0e-04 ~ 9.5e-04   （TF32 量级，比 ORT 的 1e-6 大属正常）
+argmax   : 19/19 步与 PyTorch 一致
+```
+
+> **"TF32 有 1e-3 级数值差异，但 19 步里没有一次改变选词"——
+> 这正是部署时最关心的结论。**
+
+**注意：对拍时**不能让 TRT 用自己的 argmax 喂回去**。**
+一旦某步因 TF32 选词不同，后面所有步的输入就不同了，比较全废。
+**正确做法：用 PyTorch 的 token 链锁死输入，然后**单独统计**TRT 的 argmax 和它一致几步。**
+
+### 6.3 延迟 vs cache 长度 P
+
+**固定 P 重复测（不更新 cache，所以 P 恒定），两趟法拆 host/exec**：
+
+| P | host | exec | 合计 | µs/token |
+|---|---|---|---|---|
+| 1 | 0.239 | 1.009 | 1.248 | 1248 |
+| 16 | 0.239 | 1.103 | 1.342 | 1342 |
+| 64 | 0.227 | 1.290 | 1.517 | 1517 |
+| 256 | 0.236 | 1.316 | 1.552 | 1552 |
+| 511 | 0.210 | 1.143 | 1.353 | 1353 |
+
+**P 从 1 到 511（511 倍），exec 只涨 13%（1.009 → 1.143）。**
+
+**为什么？算一下就清楚**：
+
+```
+cache 每步要拷的字节 = 2(K,V) × 12 层 × 8 头 × (P+1) × 64 × 4 = 49,152 × (P+1)
+P=511 → 25.2 MB
+权重  → 154 MB（每步都读一遍）
+比例  → 25.2 / 154 = 16%
+```
+
+**实测 13%，理论 16% —— 对得上。**
+
+> **对这个 40 M 模型，decode 由"读一遍全部权重"主导，
+> O(P) 的 cache 拷贝只占一成。所以 PagedAttention 的收益在这里体现不出来。**
+
+**这也纠正了一个"照搬论文会错"的地方**：`O(P) 拷贝 / 权重 = 49,152·P / 154e6`，
+**只有当 P 到几千、或 d_model 大得多、或 batch 很大时，cache 拷贝才会成为主项。**
+
+### 6.4 batch：吞吐几乎免费
+
+| batch | P | host | **exec** | 合计 | µs/token | **摊薄** |
+|---|---|---|---|---|---|---|
+| 1 | 16 | 0.206 | **1.096** | 1.301 | 1301 | 1.00× |
+| 2 | 16 | 0.196 | **1.093** | 1.289 | 644 | 2.02× |
+| **4** | 16 | 0.202 | **1.103** | 1.305 | **326** | **3.99×** |
+| 1 | 511 | 0.204 | **1.253** | 1.457 | 1457 | 1.00× |
+| 2 | 511 | 0.227 | 1.145 | 1.372 | 686 | 2.12× |
+| **4** | 511 | 0.212 | **1.486** | 1.697 | **424** | **3.43×** |
+
+**P=16 时 batch 1→4，工作量 ×4，exec 只涨 0.6%。**
+**说明这个形状下 decode 是 100% 权重读取受限，计算几乎免费。**
+
+**而 P=511 时摊薄降到 3.43× —— 多出来的时间正好是"多拷的 cache"**：
+
+| P | batch=4 比 batch=1 多拷 | ÷ 330 GB/s | 预测 | 实测 exec 增量 |
+|---|---|---|---|---|
+| 16 | 3 × 0.835 MB = 2.5 MB | 7.6 µs | **+7.6 µs** | **+7 µs** ✅ |
+| 511 | 3 × 25.2 MB = 75.6 MB | 229 µs | **+229 µs** | **+233 µs** ✅ |
+
+**两个都吻合到 2% 以内 —— 这就是"batch 放大 cache 拷贝、但不放大权重读取"的定量证据。**
+
+**"摊薄"这件事在两条轴上是同一个机制**：
+
+| 轴 | 做法 | 效果 |
+|---|---|---|
+| **seq（prefill）** | 一次前向吃 512 个 token | 权重读一次摊给 512 个 → **68×** |
+| **batch（decode）** | 一次前向并排算 4 个请求 | 权重读一次摊给 4 个 → **4×** |
+
+### 6.5 消不掉的那 0.20 ms
+
+```
+host = 24 次 set_input_shape + 50 次 set_tensor_address
+     ≈ 74 次 × 2.8 µs ≈ 0.21 ms
+```
+
+**它与 P、batch 都无关（是固定成本），占 decode 的 15–19%。**
+
+**而且**消不掉**：CUDA Graph 会把形状钉死，而 decode 每步 P 都变。**
+
+> **这就是为什么生产系统要走"固定形状 + 分页"：
+> 不是因为动态形状慢，是因为**动态形状让你失去了 Graph 这个最大的杠杆**。
+> vLLM 的 block table 正是"形状固定（可用 Graph）+ 只算真实 key 数（不浪费）"的解法。**
+
+---
+
+## 7. 五条被证伪的判断
+
+| # | 我原本的判断 | 实测 | 真因 |
+|---|---|---|---|
+| **7.1** | "小模型的 seq 影响能直接测出来" | seq=1 和 seq=32 延迟**一样**（0.398 / 0.353） | 10 万参数的计算量只有几微秒，**测到的是固定开销** |
+| **7.2** | "decode 是访存受限" | 直连只有 **66 GB/s**（峰值 384 的 17%） | 加 Graph 后同引擎到 **144 GB/s** → **当时瓶颈是 launch，不是带宽** |
+| **7.3** | "FP16 让 decode 快约 1.94×（字节减半）" | **1.64×**，且 FP16 的有效带宽比 FP32 低 16% | `M=1` 的 GEMV 太小，打不满 HBM |
+| **7.4** | "O(P) 的 cache 拷贝会让 decode 明显变慢" | P 1→511，exec 只涨 **13%** | 25.2 MB 对 154 MB 权重只占 16% |
+| **7.5** | "seq≥256 的 CUDA Graph 是空图" | 8/8 形状 `max\|diff\| = 0` | **对比器用了不同的随机输入**（§8.4） |
+
+**7.2 和 7.5 是两次"推翻自己上一轮的结论"。**
+
+---
+
+## 8. 踩坑记录
+
+### 8.1 TRT 11 的 API 变化（延续项目①②的经验）
+
+| 报错 | 真因 | 修法 |
+|---|---|---|
+| `'IBuilderConfig' has no attribute 'create_optimization_profile'` | TRT 10 起从 config 搬到了 **builder** | `builder.create_optimization_profile()` |
+| 本版本没有 `BuilderFlag.FP16` | TRT 11 是 strong typing | **改 ONNX 的 dtype**，不是改引擎配置 |
+
+### 8.2 `torch.onnx.export` 的导出器选择
+
+```
+ModuleNotFoundError: No module named 'onnxscript'
+```
+
+**PyTorch 2.9+ 默认的 dynamo 导出器依赖 onnxscript。** 而 legacy（`dynamo=False`）对 `dynamic_axes` 的 dim_param 名字更可控。
+**本项目所有导出都用 "先试 legacy、失败再退回 dynamo"。**
+
+### 8.3 最隐蔽的坑：两次 `GPT(cfg)` = 两套随机权重
+
+```python
+# w3_export_decode.py
+model = GPT(cfg)      # 随机初始化 A → 导出成 engine
+# w3_cache.py
+model = GPT(cfg)      # 随机初始化 B → 当作"标准答案"
+```
+
+**症状**：引擎能建、形状全对、时序数据合理，**只有数值全错（rel ≈ 1.4，argmax 0/19）**。
+
+**修法**：两个脚本都 `torch.manual_seed(WEIGHT_SEED)`，并打印**权重校验和**互相核对。
+
+> **"两边是同一个东西"必须**显式保证并验证**，不能靠"我没改它所以应该一样"。**
+
+### 8.4 三次"对比对象不一致"
+
+| # | 错了什么 | 症状 | 教训 |
+|---|---|---|---|
+| 1 | （项目①）CPU/GPU NMS 用不同随机输入 | "5 个框但 0 个匹配" | — |
+| 2 | Graph vs 直连 各生成随机 `ids` | **`rel = 0.82`** | **`rel≈1.0` 是一侧为空；`rel≈0.8` 是两侧都算了但输入不同** |
+| 3 | 两次 `GPT(cfg)` = 两套权重 | `rel ≈ 1.4` | 见 8.3 |
+
+**第 2 条是本项目最有价值的一条排错经验**：**校验失败时先看误差的**量级**，再猜原因。**
+
+### 8.5 host 指针当设备指针
+
+```python
+ctx.set_tensor_address("input_ids", nid.data_ptr())   # nid 在 CPU 上
+```
+
+**报错出现在后面的 `stream.synchronize()`**：`cudaErrorIllegalAddress`。
+**CUDA 是异步的，报错点几乎永远不是真因所在。**
+
+**修法**：喂 TRT 的张量必须 `.cuda()`，并加 `assert t.is_cuda`。
+
+### 8.6 `new_cache` 是**全量历史**，不是增量
+
+```python
+# gpt.py
+k = torch.cat([past_k, k], dim=2)
+new_cache = (k, v)          # ← 已经是 P+1 的完整历史
+```
+
+**我却又 cat 了一次 → P 每步近似翻倍（16→33→67→…→139263）→ 冲出 profile 并 OOM。**
+**正确做法：`cache = (new_k, new_v)` 直接替换。**
+
+**副作用**：那个 O(P) 拷贝没有消失，它跑到了**图内部的 `Concat`** 里，代价体现在 `exec` 列。
+
+---
+
+## 9. 已知限制
+
+1. **没有 PagedAttention / continuous batching**：cache 是每步重建的整块，所以"长上下文 + 高并发"的场景没测到。
+2. **没有多卡 / 没有 TP/PP**：单卡单请求。
+3. **权重是随机的**：无法评估"真实模型上的数值敏感性"（虽然 argmax 19/19 说明结构没问题）。
+4. **CUDA Graph 只用于 prefill 的固定形状**；decode 因形状每步变而用不了。
+5. **没有 Orin 数据**：延迟是 RTX 5060 Laptop 上的，车端要重测。
+6. **batch 实验里所有请求共享同一份 cache**：只测延迟，不测精度。
+7. **Deformable Attention 只验证了单 batch、3 个尺度、每层 4 个采样点**；真实 BEVFormer 有 4 层、8 点、多相机。
+8. **没有测 Deformable Attention 在 CUDA Graph 下的表现**（它的形状是固定的，理论上可以上 Graph）。
+
+---
+
+## 10. Deformable Attention：注意力采样不需要写 plugin
+
+### 10.1 起因：我原以为要写一个
+
+`Deformable Attention`（Deformable DETR / BEVFormer 的核心）是"在特征图上按**学习到的偏移**做双线性采样再加权求和"。
+直觉上这是"带索引的采样"，TRT 应该不支持 → 计划写一个 `grid_sample` 的 plugin。
+
+**这个假设是错的。**
+
+### 10.2 探测：TRT 11 有内置的 `IGridSampleLayer`
+
+```cpp
+// NvInfer.h:6079
+class IGridSampleLayer : public ILayer {
+    void setInterpolationMode(InterpolationMode mode);   // kLINEAR = 双线性（默认）
+    void setAlignCorners(bool alignCorners);
+    bool setSampleMode(SampleMode mode);                 // kCLAMP / kFILL / kREFLECT
+};
+```
+
+**和 PyTorch 的映射是直接的**：
+
+| PyTorch `padding_mode` | TRT `SampleMode` | 本算子要哪个 |
+|---|---|---|
+| **`'zeros'`** | **`kFILL`** | ✅ **就是这个**（采样点出界补 0） |
+| `'border'` | `kCLAMP` | — |
+| `'reflection'` | `kREFLECT` | — |
+
+**而且 `input` / `grid` 要求 rank 4 或 5，Deformable Attention 正好是**：
+
+```
+input [B, C, H, W]         ← rank 4
+grid  [B, H_out, W_out, 2] ← rank 4，把 (Nq×heads) 当 H_out、n_points 当 W_out
+```
+
+### 10.3 实现与三层验证
+
+**向量化实现**（`c1_deform_attn.py`）：多头必须把 head 塞进 batch 维，
+因为 `grid_sample` 是"整个通道维一起采"的：
+
+```python
+feat_h = feat.view(B, H, Cs, Hl, Wl).reshape(B * H, Cs, Hl, Wl)   # 通道按 head 分段
+g = grid[:, :, :, l].permute(0, 2, 1, 3, 4).reshape(B * H, Nq, P, 2)
+sampled = F.grid_sample(feat_h, g, mode="bilinear",
+                        padding_mode="zeros", align_corners=True)
+```
+
+**验证（四层，缺一不可）**：
+
+| 层 | 对照物 | 结果 |
+|---|---|---|
+| ① | **暴力循环参考**（从公式直译 + 手写双线性，不用 `grid_sample`） | **`max\|diff\| = 5.96e-08`** |
+| ② | ONNX（ORT）vs PyTorch | `8.94e-08` |
+| ③ | **engine vs PyTorch** | **`2.674e-03`（相对 5.586e-03，TF32 量级）** |
+| ④ | engine 连跑两次 | **`0.000e+00`** |
+
+**部署收益**：
+
+| | 延迟 |
+|---|---|
+| PyTorch | **1.8163 ms** |
+| TRT engine | **0.1092 ms** |
+| **加速** | **16.64×** |
+
+**而且那个"关键待验证点"也答了**：`grid` 是**中间张量**（来自 `sampling_offsets` 的 `Linear`）而不是网络输入，
+TRT 照样能建、能跑、数值对。
+
+### 10.4 结论
+
+> **"Deformable Attention 需要自己写 `grid_sample` plugin"这个说法，
+> 在 TRT 11 上不成立 —— 它有原生层，属性也全对得上（`kLINEAR` + `kFILL` + `alignCorners`）。**
+
+**但"能不能"只是第一层判断。** 第二层是"**值不值得**" ——
+本项目在 BEV 侧的两次同类探测（BEV pooling 的 `ScatterElements`、点云 scatter 的手写 plugin）
+得出了完整判据，见 **`04-bev-ops/README.md`**：
+
+| 层 | 问题 | 结论 |
+|---|---|---|
+| ① | TRT 原生层有吗 | `grid_sample` 有 → 直接用 |
+| ② | TRT 用内置 plugin 实现了吗 | `ScatterElements` 有 → **`init_libnvinfer_plugins()` 后用** |
+| ③ | 都没有 | 写 kernel |
+| **④** | **写完了要不要包成 plugin** | **先算收益**（BEV 侧的答案是"不划算"） |
+
+---
+
+## 11. 一句话总结
+
+> **这个项目量出来的不是"某个数字"，而是三件事：**
+>
+> **① Transformer 推理的两个阶段，瓶颈结构完全不同**
+> （prefill 计算受限、decode 访存受限），**所以一个引擎优化不了两个。**
+>
+> **② 三种优化各自攻击不同的东西**
+> ——`opt_shape` 选 kernel、Graph 消 launch、FP16 减字节，
+> **而它们的收益随形状反向变化，所以"该用哪个"取决于你在哪个阶段。**
+>
+> **③ 而所有"看起来该优化"的地方，都必须先确认自己处在哪个区间**
+> ——O(P) 拷贝、多流、GPU NMS 在项目①②里都因为"区间不对"而没有收益。
+>
+> **④ 而"能不能"和"值不值得"是两个问题**
+> ——Deformable Attention 的采样 TRT 原生支持（**16.64×**），
+> 所以原计划里的 plugin 计划被探测推翻了（§10）。
+>
+> **最有价值的一条：我推翻了三次自己上一轮的结论（§7.2、§7.5、§10.1），
+> 而三次都是靠"数字的形状"或"先探测 API"发现的，不是靠读代码。**
