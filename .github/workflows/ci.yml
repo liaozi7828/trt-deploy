@@ -1,0 +1,39 @@
+name: CI
+
+# 这个仓库的内容主要是四份长文档 + 脚本，所以自检的重点不是"能不能编译"
+# （TensorRT / CUDA / GPU 在 GitHub runner 上都没有，硬编只会让 CI 永远红），
+# 而是**文档不会腐烂**：交叉引用失效、产物误提交、编码混乱。
+#
+# 同一份检查在本地也能跑：python tools/ci_checks.py
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: 仓库自检
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python 语法 / 文档链接 / 仓库卫生 / 编码
+        run: python tools/ci_checks.py
+
+      # 单独一步，让失败时能一眼看出是"文档链接坏了"而不是别的
+      - name: 显示文档树（便于排查链接问题）
+        if: failure()
+        run: |
+          echo "--- 仓库文件 ---"
+          git ls-files | sed 's/^/  /'
