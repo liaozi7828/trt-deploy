@@ -1,9 +1,13 @@
 # TensorRT 11 删掉了 calibrator，INT8 该怎么做？
 
 > **以及一个更重要的问题：做完之后，你可能不该用它。**
->
-> 本文基于 **TensorRT 11.4 + CUDA 12.8 + YOLOv8n** 的实测。所有数字都能按文末命令复现。
-> 环境：RTX 5060 Laptop（sm_120, 26 SM, 8 GB）、Ubuntu 26.04 (WSL2)。
+
+**环境**：TensorRT 11.4 · CUDA 12.8 · YOLOv8n · RTX 5060 Laptop（sm_120, 26 SM, 8 GB）· Ubuntu 26.04 (WSL2)
+
+> **文中的每一个数字都可以在 30 分钟内复现** —— 数据、脚本、测量方法都在
+> <https://github.com/liaozi7828/trt-deploy>。
+> 其中包括我**测错过**的几个结论（小样本 mAP、fp16 转换器、评测集口径），
+> 以及它们是怎么被发现的。
 
 ---
 
