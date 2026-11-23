@@ -1,4 +1,7 @@
-﻿# YOLOv8 + TensorRT 部署（P3 项目②）
+# YOLOv8 + TensorRT 部署（P3 项目②）
+
+> ← [返回主页](../README.md)　·　**项目② YOLOv8 检测部署** ｜ [01](../01-resnet50-trt/README.md) · [02](../02-yolov8-trt/README.md) · [03](../03-gpt-trt/README.md) · [04](../04-bev-ops/README.md)
+
 
 从 `yolov8n.pt` 到 C++ 推理服务：CUDA 前后处理、INT8 量化、精度/性能全链路测量。
 

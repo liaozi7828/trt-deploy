@@ -1,5 +1,8 @@
 # BEV 算子边界：哪些该写 kernel/plugin，哪些不该
 
+> ← [返回主页](../README.md)　·　**项目④ BEV 算子边界** ｜ [01](../01-resnet50-trt/README.md) · [02](../02-yolov8-trt/README.md) · [03](../03-gpt-trt/README.md) · [04](../04-bev-ops/README.md)
+
+
 > 这个项目和项目②（`02-yolov8-trt`）是同一根线：**BEV 感知的前处理与后处理怎么放进 TRT**。
 > 项目② 解决的是 decode/NMS 与点云 scatter；这里补上 **BEV pooling** 和一个更重要的东西——
 > **判断"该不该自己写"的方法**。

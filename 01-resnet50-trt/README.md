@@ -1,5 +1,8 @@
 # 项目①：ResNet50 TensorRT 部署
 
+> ← [返回主页](../README.md)　·　**项目① ResNet50 分类部署** ｜ [01](../01-resnet50-trt/README.md) · [02](../02-yolov8-trt/README.md) · [03](../03-gpt-trt/README.md) · [04](../04-bev-ops/README.md)
+
+
 > **一句话**：把 PyTorch 的 ResNet50 编译成 TensorRT 引擎，用 C++ 封装成可复用的类，
 > 前处理搬到 GPU，并用实测数据量化"精度 ↔ 性能"的权衡。
 

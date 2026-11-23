@@ -1,5 +1,8 @@
 # 项目③：Transformer 推理部署与优化
 
+> ← [返回主页](../README.md)　·　**项目③ Transformer 推理优化** ｜ [01](../01-resnet50-trt/README.md) · [02](../02-yolov8-trt/README.md) · [03](../03-gpt-trt/README.md) · [04](../04-bev-ops/README.md)
+
+
 > 用一个小 GPT（40 M 参数）把 **Transformer 推理的三个阶段**都量一遍：
 > **prefill、decode、KV cache 管理**，并回答一个具体问题——
 > **"为什么工业界要把 prefill 和 decode 拆成两个引擎？"**
