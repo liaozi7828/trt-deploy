@@ -63,6 +63,21 @@ def ci95(xs: list[float]) -> float:
     return 1.96 * statistics.stdev(xs) / (n ** 0.5)
 
 
+def is_significant(rr: float, half_width: float) -> bool:
+    """比值 rr ± half_width 是否整体落在 1.0 之外（= 差异不是噪声）。
+
+    两个参数都必须是「比值单位」：rr 是逐轮配对后比值的中位数，
+    half_width 是**同一批比值**的 ci95()，单位一致才能比较。
+
+    ★ 这里曾经写错过：旧代码是 `abs(1 - rr) > ci95(ratios) / rr`，
+      左边是绝对偏差、右边是相对半宽（已经除过一次 rr），量纲混了。
+      后果：rr > 1 时不除会低估阈值 → 误报"显著"；
+            像 rr=1.50 / ci95=0.60 这种真实区间 [0.90, 2.10] 跨过 1.0 的情况，
+            旧式判成"显著"，正确答案是"在噪声内"。
+    """
+    return rr - half_width > 1.0 or rr + half_width < 1.0
+
+
 class Runner:
     """一条被测路径：某引擎 + 直连或 Graph"""
 
@@ -195,8 +210,12 @@ def main() -> int:
                                    dtype=torch.int64, device="cuda")
         for path_, mb in engs:
             tag = "fp16" if "fp16" in str(path_).lower() else "fp32"
+            # ★ 标签必须带引擎标识。否则同时传 4 个引擎时会出现两个 "fp32/direct"：
+            #   times 字典是按 label 建键的 → 静默互相覆盖 →
+            #   最终打印的"中位数"其实是两个引擎混在一起的中位数，看不出任何异常。
+            eng_tag = path_.stem
             for use_graph in (False, True):
-                lbl = f"{tag}/{'graph ' if use_graph else 'direct'}"
+                lbl = f"{tag}/{eng_tag}/{'graph' if use_graph else 'direct'}"
                 try:
                     own_eng = load_engine(path_)      # ★ 每条路径一份独立引擎
                     p = Runner(lbl, own_eng, use_graph, shared_ids)
@@ -211,6 +230,15 @@ def main() -> int:
         if not paths:
             print("  没有任何可测路径")
             continue
+
+        # ★ 标签必须唯一。times 是按 label 建键的，重复就会把两台引擎的样本
+        #   静默合并成一个列表 —— 打印出来是"同一行重复两次、数字完全一样"，
+        #   看上去像排版问题，实际上是两台引擎的中位数混在一起，谁都不等于。
+        dup = [l for l in {p.label for p in paths}
+               if [q.label for q in paths].count(l) > 1]
+        if dup:
+            raise RuntimeError(
+                f"路径标签重复：{dup} —— times 字典会静默覆盖，先修标签再测")
 
         # ---- 校验：Graph 重放必须和同一引擎的直连一致 ----
         #
@@ -288,9 +316,29 @@ def main() -> int:
                 if not ratios:
                     continue
                 rr = statistics.median(ratios)
-                c = ci95(ratios) / rr * 100 if len(ratios) > 1 else 0.0
-                verdict = "显著" if abs(1 - rr) > ci95(ratios) / rr else "在噪声内"
-                print(f"  {p.label:<16} {rr:6.3f}x  ±{c:4.1f}%   CPU/GPU 时间 {1 / rr:5.2f}×  → {verdict}")
+                hw = ci95(ratios)                  # 绝对半宽（比值单位），与 rr 同量纲
+                c = hw / rr * 100 if len(ratios) > 1 else 0.0
+                verdict = "显著" if is_significant(rr, hw) else "在噪声内"
+                print(f"  {p.label:<16} {rr:6.3f}x  ±{c:4.1f}%  "
+                      f"区间[{rr - hw:.3f},{rr + hw:.3f}]  CPU/GPU 时间 {1 / rr:5.2f}×  → {verdict}")
+
+        # ---- 多引擎时：同模式、跨引擎的逐轮配对 ----
+        # 这是结论① 真正需要的那种对比（"只改 profile 里三个数字"）。
+        # 单引擎对里没有它，所以以前只能跨运行手算两个中位数 —— 而跨运行正是漂移的来源。
+        for mech in ("direct", "graph"):
+            sel = [p.label for p in paths if p.label.endswith("/" + mech)]
+            if len(sel) < 2:
+                continue
+            print(f"\n  跨引擎对比 · 同模式 {mech}（逐轮配对，第一台为分子）")
+            print("  " + "-" * 48)
+            ref = sel[0]
+            for other in sel[1:]:
+                rs = [a / b for a, b in zip(times[ref], times[other]) if b > 0]
+                if not rs:
+                    continue
+                rr2 = statistics.median(rs)
+                c2 = ci95(rs) / rr2 * 100 if len(rs) > 1 else 0.0
+                print(f"  {ref} ÷ {other} = {rr2:6.3f}x  ±{c2:4.1f}%")
 
     print("\n" + "=" * 96)
     print("怎么读：")
