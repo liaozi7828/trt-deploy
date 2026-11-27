@@ -1,0 +1,17 @@
+{
+  "note": "M4 全部数字；同一次运行内配对测量。m4a 为 dense+eager 的口径，m4c 为分页池口径。",
+  "m4a": [
+    {"rows": 2, "blocking": {"median": 50.4, "p95": 79.3, "spike": 353.2, "wall": 1632, "ttft_steps": 0},
+     "chunked":  {"median": 71.5, "p95": 87.2, "spike": 119.6, "wall": 1577, "ttft_steps": 7}},
+    {"rows": 8, "blocking": {"median": 195.2, "p95": 222.6, "spike": 490.3, "wall": 5073, "ttft_steps": 0},
+     "chunked":  {"median": 214.6, "p95": 240.0, "spike": 261.6, "wall": 5087, "ttft_steps": 7}}
+  ],
+  "m4b_kernel_only_ms": {"1": 0.363, "2": 0.334, "4": 0.443, "8": 0.790},
+  "m4c": [
+    {"chunk": 1024, "nchunks": 1,  "prefill_ms": 59.7,  "prefill_tps": 15268, "decode_ms": 24.69},
+    {"chunk": 512,  "nchunks": 2,  "prefill_ms": 81.8,  "prefill_tps": 11137, "decode_ms": 23.12},
+    {"chunk": 256,  "nchunks": 4,  "prefill_ms": 123.1, "prefill_tps": 7400,  "decode_ms": 24.07},
+    {"chunk": 128,  "nchunks": 8,  "prefill_ms": 262.4, "prefill_tps": 3472,  "decode_ms": 23.27},
+    {"chunk": 64,   "nchunks": 15, "prefill_ms": 430.5, "prefill_tps": 2116,  "decode_ms": 23.05}
+  ]
+}

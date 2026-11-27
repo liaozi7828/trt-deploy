@@ -1,0 +1,15 @@
+{
+  "note": "M5a prefix caching：8 条请求共享 512 token 系统提示，各自的尾巴 14 token；块 16；decode 4 步。",
+  "prefix_tokens": 512,
+  "suffix_tokens": 14,
+  "reqs": 8,
+  "block_size": 16,
+  "blocks_in_cache": 32,
+  "reused_kv_tokens": 3584,
+  "ttft_off_ms": [93.5, 103.3, 92.7, 87.9, 90.6, 104.3, 90.2, 89.2],
+  "ttft_on_ms": [89.0, 31.5, 30.6, 31.2, 29.7, 30.8, 36.1, 29.7],
+  "total_prefill_off_ms": 751.8,
+  "total_prefill_on_ms": 308.7,
+  "all_tokens_match": true,
+  "forward_floor_ms": 26.0
+}

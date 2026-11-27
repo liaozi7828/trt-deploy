@@ -1,14 +1,17 @@
-# TensorRT 部署实验台
+# 推理部署实验台
 
 [![CI](https://github.com/liaozi7828/trt-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/liaozi7828/trt-deploy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 四个项目，一条主线：**在 TensorRT 上把"模型能跑"变成"知道它为什么这么快、以及哪里不该优化"。**
+> 五个项目，一条主线：**把"模型能跑"变成"知道它为什么这么快、以及哪里不该优化"。**
+>
+> 01–04 在 TensorRT 上做（算子/kernel 层面）；05 故意离开 TRT，因为它问的是另外三件事——
+> **一次前向的固定成本、缓存怎么组织、请求怎么排队**。
 >
 > 每个结论都有可复算的数字；被推翻的判断也都留在原地，没有删。
 
-**环境**：Ubuntu (WSL2) · CUDA 12.8 · TensorRT 11.4 · RTX 5060 Laptop 8 GB (sm_120, 26 SM)
-**规模说明**：模型都很小（ResNet50 / YOLOv8n / 40 M 的 GPT / 3 层 Deformable Attention）——
+**环境**：Ubuntu (WSL2) · CUDA 12.8 · TensorRT 11.4 · PyTorch 2.11 + Triton 3.6 · RTX 5060 Laptop 8 GB (sm_120, 26 SM)
+**规模说明**：模型都很小（ResNet50 / YOLOv8n / 40 M 的 GPT / 3 层 Deformable Attention / Qwen2.5-0.5B）——
 **目的是看清单个瓶颈，不是刷 SOTA 吞吐。**
 
 ---
@@ -21,6 +24,7 @@
 | 02 | **YOLOv8 检测 + 端到端优化** | 端到端 p50 **3.02×**、p99 **4.02×**；定位到"推理 2.0 ms 里 1.4 ms 是 CPU 派发" | [README](02-yolov8-trt/README.md) |
 | 03 | **Transformer 推理优化** | 证明**一个引擎优化不了 prefill 和 decode**；KV cache 进引擎后 argmax **19/19** 一致 | [README](03-gpt-trt/README.md) |
 | 04 | **BEV 算子边界** | "TRT 没有这个算子" ≠ "该写 plugin"：**四个算子逐个实测**，两个不用写、一个写了但不划算 | [README](04-bev-ops/README.md) |
+| 05 | **LLM serving** | 一次 decode = **1851 个算子 × 9.2 µs**，GPU 只占 2.76 ms；分页 KV 省显存 3.2×、上图再拿 **3.1–3.3×** | [README](05-llm-serving/README.md) |
 
 ---
 
@@ -61,6 +65,11 @@
 | 写了 kernel 就该包成 plugin | 收益 **2%**，代价是静默丢点 → **判定不该** | 项目④ §4 |
 | GPU 版 NMS 一定更快 | 跨主机边界时慢 **180×**；但融进同一 kernel 后快 **10×** | 项目② §9 |
 | 把 NMS 做进引擎更省 | 它与 CUDA Graph 互斥：省 0.06 ms，**赔 1.4 ms** | 项目② §19 |
+| 分页 attention 会让注意力变快 | 与连续 KV **打平（1.07×/0.98×）**；它真正的价值是让形状固定、从而能上图 | 项目⑤ M3 |
+| 连续批处理能大幅提升吞吐 | 步数少 **25%**、利用率 +20 pt，吞吐只 **+5%** —— 补位的 prefill 把收益还回去了 | 项目⑤ M2 |
+| chunked prefill 是免费的 | 中位数 +10~42%，新请求 TTFT 从 0 步变 7 步 | 项目⑤ M4 |
+| decode 慢是因为算得多 | 一次 decode **1851 个算子**，其中 47% 是 `view`/`transpose`，矩阵乘只占 9% | 项目⑤ M0c |
+| 形状固定就能上 CUDA Graph | 形状只是必要条件；`StaticCache` 原地写 `cumulative_length` → `skipping cudagraphs due to mutated inputs` | 项目⑤ M0d |
 
 ---
 
@@ -101,6 +110,13 @@ python c2_verify_engine.py         # Deformable Attention 引擎验证
 # 04 BEV 算子
 cd 04-bev-ops/x && python c3_bev_pool.py       # BEV pooling 探测
 cd c4 && cmake -S . -B build -DTRT_ROOT=$TRT_ROOT && cmake --build build -j
+
+# 05 LLM serving（PyTorch + Triton，需自己下 Qwen2.5-0.5B-Instruct）
+cd 05-llm-serving
+python m0c_count_ops.py                    # 一次 decode 到底有几个算子
+python m0e_manual_graph.py                 # 手动 CUDA Graph 3.71×
+python m3d_graph_paged.py --rows 1,8,24,48 # 分页 KV + 整步上图
+bash   run_m5a.sh                          # prefix caching
 ```
 
 **注意**：`*.onnx` / `*.engine` 都在 `.gitignore` 里，需要用各项目的脚本自己生成。
@@ -109,7 +125,10 @@ cd c4 && cmake -S . -B build -DTRT_ROOT=$TRT_ROOT && cmake --build build -j
 
 ## 说明
 
-- **权重是随机初始化的**（`WEIGHT_SEED`），因为目标是测量延迟与数值一致性，不是模型效果。
-- **所有延迟都是 RTX 5060 Laptop（sm_120）上的**，车端（Orin）需要重测——方案见 [P5-orin-plan](02-yolov8-trt/docs/P5-orin-plan.md)。
-- **没有在真实硬件上跑过 Orin**，也没有生产级服务框架（无 continuous batching、无调度器）。
-  这两点写在每个 README 的「已知限制」里。
+- **01–03 的权重是随机初始化的**（`WEIGHT_SEED`），因为目标是测量延迟与数值一致性，不是模型效果；
+  **05 用的是真实训练权重**（Qwen2.5-0.5B-Instruct），所以那里的 token 可以当正确性判据。
+- **所有延迟都是 RTX 5060 Laptop（sm_120）上的**，车端（Orin）需要重测——方案见 [Orin 计划](02-yolov8-trt/docs/P5-orin-plan.md)。
+- **没有在真实硬件上跑过 Orin**，也没有生产级服务框架。05 有连续批处理与分页 KV 的**最小实现**，
+  但没有 HTTP server、没有采样、没有淘汰策略——这些都写在每个 README 的「已知限制」里。
+- **05 不用 TensorRT 是刻意的**：在 0.5B 这个尺度上，一次 decode 的 17–26 ms 里绝大部分是 Python 派发，
+  TRT 的内核选择根本不是瓶颈。这也解释了为什么 03 的 TRT 结论不能直接搬到这里——先问瓶颈在哪，再选工具。
